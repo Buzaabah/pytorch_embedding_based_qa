@@ -9,18 +9,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+class EmbeddingEncoder(nn.Module):
+    """Encoder for Word Embeddings."""
+    def __init__(self, dim_embedding, dim_latent, dropout=None, act=torch.sigmoid):
+        super(EmbeddingEncoder, self).__init__()
+        self.dropout = dropout
+        self.enc = nn.Sequential(nn.Linear(dim_embedding,256),nn.ReLU(),
+                                nn.Linear(256,dim_latent,nn.ReLU()))
+
+    def forward(self, embedding):
+        latent = self.enc(embedding)
+        return latent
+
+class EmbeddingDecoder(nn.Module):
+    """Decoder for Word Embeddings."""
+    def __init__(self, dim_embedding, dim_latent, dropout=None, act=torch.sigmoid):
+        super(EmbeddingDecoder, self).__init__()
+        self.dropout = dropout
+        self.dec = nn.Sequential(nn.Linear(dim_latent,256),nn.ReLU(),
+                                nn.Linear(256,dim_embedding,nn.ReLU()))
+
+    def forward(self, latent):
+        embedding = self.dec(latent)
+        return embedding
+
 class AnswerSelection(nn.Module):
     def __init__(self, conf):
         super(AnswerSelection, self).__init__()
         self.vocab_size = conf['vocab_size']
         self.hidden_dim = conf['hidden_dim']
         self.embedding_dim = conf['embedding_dim']
+        self.latent_dim = conf['latent_dim']
         self.question_len = conf['question_len']
         self.answer_len = conf['answer_len']
         self.batch_size = conf['batch_size']
 
         self.word_embeddings = nn.Embedding(self.vocab_size, self.embedding_dim)
-        self.lstm = nn.LSTM(self.embedding_dim, self.hidden_dim // 2, num_layers=1, bidirectional=True, batch_first=True)
+        self.lstm = nn.LSTM(self.latent_dim, self.hidden_dim // 2, num_layers=1, bidirectional=True, batch_first=True)
         self.cnns = nn.ModuleList([nn.Conv1d(self.hidden_dim, 500, filter_size, stride=1, padding=filter_size-(i+1)) for i, filter_size in enumerate([1,3,5])])
         self.question_maxpool = nn.MaxPool1d(self.question_len, stride=1)
         self.answer_maxpool = nn.MaxPool1d(self.answer_len, stride=1)
@@ -28,6 +53,9 @@ class AnswerSelection(nn.Module):
         self.init_weights()
         self.hiddenq = self.init_hidden(self.batch_size)
         self.hiddena = self.init_hidden(self.batch_size)
+
+        self.emb_encoder = EmbeddingEncoder(self.embedding_dim, self.latent_dim)
+        self.emb_decoder = EmbeddingDecoder(self.embedding_dim, self.latent_dim)
 
     def init_hidden(self, batch_len):
         return (autograd.Variable(torch.randn(2, batch_len, self.hidden_dim // 2)), #.cuda(),
@@ -40,6 +68,8 @@ class AnswerSelection(nn.Module):
     def forward(self, question, answer):
         question_embedding = self.word_embeddings(question)
         answer_embedding = self.word_embeddings(answer)
+        question_embedding = self.emb_encoder(question_embedding)
+        answer_embedding = self.emb_encoder(answer_embedding)
         q_lstm, self.hiddenq = self.lstm(question_embedding, self.hiddenq)
         a_lstm, self.hiddena = self.lstm(answer_embedding, self.hiddena)
         q_lstm = q_lstm.contiguous()
@@ -79,11 +109,19 @@ class AnswerSelection(nn.Module):
         zeros = autograd.Variable(torch.zeros(good_similarity.size()[0]), requires_grad=False) #.cuda()
         margin = autograd.Variable(torch.linspace(0.05,0.05,good_similarity.size()[0]), requires_grad=False) #.cuda()
         
-        loss = torch.max(zeros, autograd.Variable.sub(margin, autograd.Variable.sub(bad_similarity, good_similarity)))
+        loss = torch.max(zeros, margin + bad_similarity - good_similarity)
         #similarity = torch.stack([good_similarity,bad_similarity],dim=1)
         #loss = torch.squeeze(torch.stack(map(lambda x: F.relu(0.05 - x[0] + x[1]), similarity), dim=0))
-        accuracy = torch.eq(loss,zeros).type(torch.DoubleTensor).mean()
-        return loss.sum(), accuracy.data[0]
+
+        # accuracy = torch.eq(loss,zeros).type(torch.DoubleTensor).mean()
+
+        reconst_embedding = self.emb_decoder(self.emb_encoder(self.word_embeddings.weight))
+        diff = reconst_embedding - self.word_embeddings.weight
+        cost_encdec = torch.sum(diff*diff)
+        loss = loss.sum() + cost_encdec
+
+        # return loss, accuracy.data[0]
+        return loss
 """
 class StrToBytes:
     def __init__(self, fileobj):
@@ -104,7 +142,7 @@ class Evaluate():
             self.model = AnswerSelection(self.conf)
             if conf['resume']:
                 self.model.load_state_dict(torch.load("saved_model/answer_selection_model_cnnlstm"))
-            self.model.cuda()
+            # self.model.cuda()
             self.train()
         if conf['mode'] == 'test':
             print ("Testing")
@@ -147,8 +185,8 @@ class Evaluate():
         good_answers = torch.LongTensor(self.pad_answer(good_answers))
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.conf['learning_rate'])
 
-        for i in xrange(epochs):
-            bad_answers = torch.LongTensor(self.pad_answer(random.sample(self.all_answers.values(), len(good_answers))))
+        for i in range(epochs):
+            bad_answers = torch.LongTensor(self.pad_answer(random.sample(list(self.all_answers.values()), len(good_answers))))
             train_loader = data.DataLoader(dataset=torch.cat([questions,good_answers,bad_answers],dim=1), batch_size=batch_size)
             avg_loss = []
             avg_acc = []
@@ -161,14 +199,16 @@ class Evaluate():
                 optimizer.zero_grad()
                 self.model.hiddenq = self.model.init_hidden(len(train))
                 self.model.hiddena = self.model.init_hidden(len(train))
-                loss, acc = self.model.fit(batch_question, batch_good_answer, batch_bad_answer)
-                avg_loss.append(loss.data[0])
-                avg_acc.append(acc)
+                # loss, acc = self.model.fit(batch_question, batch_good_answer, batch_bad_answer)
+                loss = self.model.fit(batch_question, batch_good_answer, batch_bad_answer)
+                avg_loss.append(loss)
+                # avg_acc.append(acc)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm(self.model.parameters(), 0.25)
                 optimizer.step()
                 
-            print("Epoch: {0} Epoch Average loss: {1} Accuracy {2}".format(str(i), str(np.mean(avg_loss)), str(np.mean(avg_acc))))
+            # print("Epoch: {0} Epoch Average loss: {1} Accuracy {2}".format(str(i), str(np.mean(avg_loss)), str(np.mean(avg_acc))))
+            print("Epoch: {0} Epoch Average loss: {1}".format(str(i), str(np.mean(avg_loss))))
             torch.save(self.model.state_dict(), "saved_model/answer_selection_model_cnnlstm")
             if i % 50 == 0 and i > 0:
                 self.validate(validation=True)
@@ -243,9 +283,10 @@ conf = {
     'epochs':10000,
     'embedding_dim':512,
     'hidden_dim':512,
+    'latent_dim':100,
     'learning_rate':0.01,
     'margin':0.05,
-    'mode':'test',
-    'resume':1
+    'mode':'train',
+    'resume':0
 }
 ev = Evaluate(conf)
